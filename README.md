@@ -12,8 +12,18 @@
 ```
 cd mini-tmux
 cargo build
-cargo run -- new -s work
+cargo run -- new -s work      # セッションを作ってアタッチ
+cargo run -- attach -s work   # 既存セッションに再アタッチ
+cargo run -- ls               # 起動中のセッション一覧
 ```
+
+セッション内でのキー操作:
+
+| キー | 動作 |
+| --- | --- |
+| `Ctrl-b d` | デタッチする(シェルは裏で動き続ける) |
+| `Ctrl-b Ctrl-b` | `Ctrl-b` 自体をシェルに送る |
+| それ以外 | すべてそのままシェルに渡る(`Ctrl-C` なども含む) |
 
 Rust未導入の場合は https://rustup.rs からインストールする。初回 `cargo build`
 はネットワーク経由で依存クレートを取得する。
