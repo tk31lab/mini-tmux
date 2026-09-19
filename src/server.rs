@@ -45,7 +45,11 @@ pub fn run(session_name: &str, shell_command: &[&str]) -> std::io::Result<()> {
     let mut recent_output: Vec<u8> = Vec::new();
 
     loop {
-        let (stream, _addr) = listener.accept()?;
+        let stream = match wait_for_client(&listener, &process, &mut recent_output)? {
+            WaitOutcome::ClientArrived(stream) => stream,
+            WaitOutcome::ShellExited => break,
+        };
+
         match handle_client(stream, &process, &mut recent_output) {
             Ok(ClientOutcome::Detached) => continue, // 次のattachを待つ
             Ok(ClientOutcome::ShellExited) => break,
@@ -56,12 +60,72 @@ pub fn run(session_name: &str, shell_command: &[&str]) -> std::io::Result<()> {
         }
     }
 
-    // 子プロセス(シェル)は、ShellExitedに至った経路の中で
-    // notify_shell_exited()が既にwaitpid済みなので、ここでは
-    // fdの掃除だけ行う。
+    // シェルがクライアント接続中に終了した場合は notify_shell_exited() が
+    // 既にwaitpid済み。デタッチ中に終了した場合はここが初回になる
+    // (二重に呼んでもECHILDが返るだけなので、区別せず呼ぶ)。
+    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(process.child_pid), None);
     let _ = nix::unistd::close(process.master_fd);
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
+}
+
+enum WaitOutcome {
+    ClientArrived(UnixStream),
+    /// クライアントが繋がっていない間にシェルが終了した。
+    ShellExited,
+}
+
+/// クライアントの接続を待つ。ただし待っている間も、ptyの出力を読み続ける。
+///
+/// 単に accept() でブロックしてしまうと、デタッチ中は誰もptyを読まなくなる。
+/// するとカーネルのptyバッファがすぐ詰まり、画面に出力しようとしたコマンドが
+/// write()でブロックして止まってしまう(「長いビルドを流してデタッチ、後で
+/// 戻ったら終わっている」が成立しなくなる)。本家tmuxもサーバーは常にptyを
+/// 読み続けている。
+///
+/// 読んだ内容は送る相手がいないので、再送用のバッファに溜めるだけ。結果として
+/// デタッチ中の出力も、再アタッチしたときにある程度見えるようになる。
+fn wait_for_client(
+    listener: &UnixListener,
+    process: &PtyProcess,
+    recent_output: &mut Vec<u8>,
+) -> std::io::Result<WaitOutcome> {
+    let master_fd = process.master_fd;
+
+    // Safety: どちらのfdも呼び出し元(run)が生存させている。
+    let master_borrowed = unsafe { BorrowedFd::borrow_raw(master_fd) };
+    let listener_borrowed = unsafe { BorrowedFd::borrow_raw(listener.as_raw_fd()) };
+
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        let mut fds = [
+            PollFd::new(master_borrowed, PollFlags::POLLIN),
+            PollFd::new(listener_borrowed, PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+        let master_revents = fds[0].revents().unwrap_or_else(PollFlags::empty);
+        let listener_revents = fds[1].revents().unwrap_or_else(PollFlags::empty);
+
+        if master_revents.intersects(PollFlags::POLLIN) {
+            match pty::read_from_pty(master_fd, &mut chunk) {
+                Ok(0) | Err(_) => return Ok(WaitOutcome::ShellExited),
+                Ok(n) => remember_output(recent_output, &chunk[..n]),
+            }
+        }
+        if master_revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
+            return Ok(WaitOutcome::ShellExited);
+        }
+
+        if listener_revents.intersects(PollFlags::POLLIN) {
+            let (stream, _addr) = listener.accept()?;
+            return Ok(WaitOutcome::ClientArrived(stream));
+        }
+    }
 }
 
 enum ClientOutcome {
