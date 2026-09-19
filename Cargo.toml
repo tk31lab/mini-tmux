@@ -1,0 +1,14 @@
+[package]
+name = "mini-tmux"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# pty/termios/fork まわりのPOSIX APIをRustから呼ぶためのクレート。
+# feature名はnixのバージョンによって変わることがあるので、`cargo build`が
+# featureが見つからないと言ってきたら https://docs.rs/nix でそのバージョンの
+# feature一覧を確認して調整すること。
+nix = { version = "0.29", features = ["term", "process", "signal", "fs", "poll"] }
+
+# SIGWINCHなどのUnixシグナルを安全に受け取るためのクレート(Milestone 6で使う想定)。
+signal-hook = "0.3"
