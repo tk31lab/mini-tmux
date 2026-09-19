@@ -8,8 +8,6 @@
 //! 引数パースはあえて手書き(clap等には頼らない)。最初はシンプルにしておいて、
 //! 使いにくくなったら差し替える。
 
-#![allow(dead_code)] // スケルトンの間は未使用警告を黙らせている。実装が進んだら外してよい。
-
 mod pty;
 mod term;
 mod protocol;
@@ -114,5 +112,14 @@ fn cmd_attach(session_name: &str) {
 
 /// Milestone 7 (拡張): 起動中のセッション一覧を表示する。
 fn cmd_ls() {
-    todo!("session.rs にセッション一覧を管理する仕組みを用意してから実装する")
+    let sessions = session::list_sessions();
+
+    if sessions.is_empty() {
+        println!("起動中のセッションはありません");
+        return;
+    }
+
+    for name in sessions {
+        println!("{name}");
+    }
 }
