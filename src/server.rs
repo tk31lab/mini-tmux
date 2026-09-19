@@ -82,8 +82,11 @@ fn handle_client(stream: UnixStream, process: &PtyProcess) -> std::io::Result<Cl
             PollFd::new(master_borrowed, PollFlags::POLLIN),
             PollFd::new(socket_borrowed, PollFlags::POLLIN),
         ];
-        if poll(&mut fds, PollTimeout::NONE).is_err() {
-            return Ok(ClientOutcome::Detached);
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            // シグナルで中断されただけなら、接続を切らずにやり直す。
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => return Ok(ClientOutcome::Detached),
         }
         let master_revents = fds[0].revents().unwrap_or_else(PollFlags::empty);
         let socket_revents = fds[1].revents().unwrap_or_else(PollFlags::empty);
@@ -121,9 +124,9 @@ fn handle_client(stream: UnixStream, process: &PtyProcess) -> std::io::Result<Cl
                                 let _ = pty::write_to_pty(master_fd, &bytes);
                             }
                             ClientMessage::Resize { rows, cols } => {
-                                // Milestone 6で実装する。今はまだクライアントが
-                                // このメッセージを送ってくることはない。
-                                let _ = (rows, cols);
+                                // ptyにサイズを設定すると、カーネルがシェル側へ
+                                // SIGWINCHを送ってくれる(vim等はそれで再描画する)。
+                                let _ = pty::resize_pty(master_fd, rows, cols);
                             }
                             ClientMessage::Detach => return Ok(ClientOutcome::Detached),
                         }

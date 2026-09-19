@@ -113,7 +113,22 @@ pub fn write_to_pty(master_fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
 
 /// Milestone 6: 自分のターミナルのサイズ変更をptyに伝える。
 /// TIOCSWINSZ ioctlで、master_fd経由でslave側のwindow sizeを更新する。
+///
+/// サイズを設定すると、カーネルがslave側の制御端末に紐づく
+/// フォアグラウンドプロセスグループ(= シェルと、その上で動いている
+/// vimなど)に自動的にSIGWINCHを送ってくれる。つまりこちらから
+/// 明示的に通知する必要はない。
 pub fn resize_pty(master_fd: RawFd, rows: u16, cols: u16) -> std::io::Result<()> {
-    let _ = (master_fd, rows, cols);
-    todo!("nix::pty::Winsize を組み立てて、ioctl(master_fd, TIOCSWINSZ, ...) 相当を呼ぶ")
+    let winsize = nix::libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        // ピクセル単位のサイズ。使っていないので0でよい。
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    if unsafe { nix::libc::ioctl(master_fd, nix::libc::TIOCSWINSZ as _, &winsize) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }

@@ -54,3 +54,18 @@ impl Drop for RawModeGuard {
         let _ = termios::tcsetattr(borrowed, SetArg::TCSANOW, &self.original);
     }
 }
+
+/// Milestone 6: `fd`が指す端末の現在のサイズを `(行数, 列数)` で返す。
+///
+/// 端末のサイズはカーネルがttyごとに保持していて、TIOCGWINSZ ioctlで
+/// 問い合わせる。ウィンドウがリサイズされると、カーネルがこの値を更新した
+/// 上でSIGWINCHを送ってくるので、受け取った側は改めてこれを呼んで新しい
+/// サイズを知る、という流れになる。
+pub fn window_size(fd: RawFd) -> std::io::Result<(u16, u16)> {
+    let mut winsize: nix::libc::winsize = unsafe { std::mem::zeroed() };
+
+    if unsafe { nix::libc::ioctl(fd, nix::libc::TIOCGWINSZ as _, &mut winsize) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((winsize.ws_row, winsize.ws_col))
+}

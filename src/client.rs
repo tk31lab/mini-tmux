@@ -5,8 +5,8 @@
 //!   - 自分の標準入力をraw modeにする(term::RawModeGuard)
 //!   - 自分の標準入力から読んだバイトをそのままソケットに送る
 //!   - ソケットから受け取ったバイトをそのまま自分の標準出力に書く
-//!   - Milestone 6: SIGWINCHを受け取ったら、新しい端末サイズをサーバーに
-//!     通知する(signal-hookクレートの利用を想定)
+//!   - SIGWINCH(ウィンドウのリサイズ)を検知して、新しい端末サイズを
+//!     サーバーに通知する
 //!
 //! デタッチについて: 今のところ専用のキーシーケンス(例: Ctrl-b d)は
 //! 実装していない。クライアントプロセスを終了させる(Ctrl-Cではなく、
@@ -18,6 +18,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 
+use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
 use crate::protocol::{self, ClientMessage, ServerMessage};
@@ -42,20 +43,53 @@ pub fn attach(session_name: &str) -> std::io::Result<()> {
     // 含め)ガードがDropされ、自動的に元のterminal設定に戻る。
     let _raw_guard = term::RawModeGuard::enable(0)?;
 
-    relay_stdin_and_socket(stream)
+    let resize_events = watch_resize()?;
+
+    relay_stdin_and_socket(stream, resize_events)
+}
+
+/// Milestone 6: SIGWINCHのハンドラを登録し、通知を受け取るためのfdを返す。
+///
+/// いわゆる「self-pipe trick」。シグナルハンドラの中でできることは非常に
+/// 限られている(async-signal-safeな操作のみ)ので、ハンドラでは
+/// 「パイプに1バイト書く」だけを行い、実際の処理はpollループ側で行う。
+/// こうするとシグナルを「読み取り可能になったfd」というpollが扱える形に
+/// 変換できる。単なるフラグ変数と違い、poll()でブロックする直前に
+/// シグナルが来ても取りこぼさない。
+fn watch_resize() -> std::io::Result<UnixStream> {
+    let (reader, writer) = UnixStream::pair()?;
+    // writerの所有権はsignal-hook側に渡る(シグナル発生時にここへ書き込む)。
+    signal_hook::low_level::pipe::register(signal_hook::consts::SIGWINCH, writer)?;
+    Ok(reader)
+}
+
+/// 今の自分の端末サイズをサーバーに通知する。
+fn send_window_size(socket_writer: &mut UnixStream) -> std::io::Result<()> {
+    let (rows, cols) = term::window_size(0)?;
+    let frame = protocol::encode_client_message(&ClientMessage::Resize { rows, cols });
+    socket_writer.write_all(&frame)
 }
 
 /// 自分の標準入力/出力とソケットとの間でデータを中継する。poll(2)で
-/// 標準入力とソケットを同時に監視する単一ループ(main.rsのMilestone 2の
-/// 実装と同じ考え方)。
-fn relay_stdin_and_socket(stream: UnixStream) -> std::io::Result<()> {
+/// 標準入力・ソケット・リサイズ通知の3つを同時に監視する単一ループ。
+fn relay_stdin_and_socket(
+    stream: UnixStream,
+    resize_events: UnixStream,
+) -> std::io::Result<()> {
     let socket_fd = stream.as_raw_fd();
+    let resize_fd = resize_events.as_raw_fd();
     let mut socket_writer = stream.try_clone()?;
 
-    // Safety: fd 0はプロセス全体で有効。socket_fdはこの関数の終わりまで
-    // `stream`がdropされないので有効。
+    // アタッチした時点のサイズをまず伝える。これをしないと、サーバー側の
+    // ptyは作成時のデフォルト(24x80)のままになってしまう。再アタッチ時に
+    // 前回と違うサイズの端末から繋ぐ場合もあるので、毎回必要。
+    let _ = send_window_size(&mut socket_writer);
+
+    // Safety: fd 0はプロセス全体で有効。socket_fd/resize_fdは、それぞれの
+    // UnixStreamがこの関数の終わりまでdropされないので有効。
     let stdin_fd = unsafe { BorrowedFd::borrow_raw(0) };
     let socket_borrowed = unsafe { BorrowedFd::borrow_raw(socket_fd) };
+    let resize_borrowed = unsafe { BorrowedFd::borrow_raw(resize_fd) };
 
     let mut recv_buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -64,12 +98,27 @@ fn relay_stdin_and_socket(stream: UnixStream) -> std::io::Result<()> {
         let mut fds = [
             PollFd::new(stdin_fd, PollFlags::POLLIN),
             PollFd::new(socket_borrowed, PollFlags::POLLIN),
+            PollFd::new(resize_borrowed, PollFlags::POLLIN),
         ];
-        if poll(&mut fds, PollTimeout::NONE).is_err() {
-            break;
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            // シグナルで中断されただけなので、やり直す。ここで抜けてしまうと
+            // ウィンドウをリサイズした瞬間にクライアントが終了してしまう。
+            Err(Errno::EINTR) => continue,
+            Err(_) => break,
         }
+
         let stdin_revents = fds[0].revents().unwrap_or_else(PollFlags::empty);
         let socket_revents = fds[1].revents().unwrap_or_else(PollFlags::empty);
+        let resize_revents = fds[2].revents().unwrap_or_else(PollFlags::empty);
+
+        if resize_revents.intersects(PollFlags::POLLIN) {
+            // 溜まっている通知バイトは読み捨てる(連続したリサイズが
+            // まとめられていることがあるが、やることは「今のサイズを
+            // 送り直す」の1回で足りる)。
+            let _ = nix::unistd::read(resize_fd, &mut chunk);
+            let _ = send_window_size(&mut socket_writer);
+        }
 
         if stdin_revents.intersects(PollFlags::POLLIN) {
             match nix::unistd::read(0, &mut chunk) {
@@ -116,9 +165,4 @@ fn relay_stdin_and_socket(stream: UnixStream) -> std::io::Result<()> {
     }
 
     Ok(())
-}
-
-/// Milestone 6: SIGWINCHのハンドラ登録と、リサイズ通知の送信。
-fn watch_resize(_stream: &UnixStream) {
-    todo!("signal-hookでSIGWINCHを監視し、ioctl(TIOCGWINSZ)で新しいサイズを取得して\nprotocol::ClientMessage::Resizeとして送る")
 }
