@@ -132,3 +132,4 @@ pub fn resize_pty(master_fd: RawFd, rows: u16, cols: u16) -> std::io::Result<()>
     }
     Ok(())
 }
+

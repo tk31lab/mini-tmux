@@ -21,6 +21,11 @@ use crate::protocol::{self, ClientMessage, ServerMessage};
 use crate::pty::{self, PtyProcess};
 use crate::session;
 
+/// アタッチしてきたクライアントに送り直す、直近のpty出力の保持量。
+///
+/// 端末のサイズや内容によるが、だいたい1画面分をカバーできる程度にしている。
+const REPLAY_BUFFER_BYTES: usize = 8 * 1024;
+
 /// サーバーのメインループ。呼び出したら、シェルが終了するまで戻ってこない。
 /// クライアントは何度でも繋いだり切ったり(アタッチ/デタッチ)できる。
 pub fn run(session_name: &str, shell_command: &[&str]) -> std::io::Result<()> {
@@ -35,9 +40,13 @@ pub fn run(session_name: &str, shell_command: &[&str]) -> std::io::Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     let process = pty::spawn_in_pty(shell_command)?;
 
+    // クライアントが繋がっていない間もptyの出力は流れてくる。アタッチして
+    // きたクライアントに直近の内容を送り直せるよう、ここで保持しておく。
+    let mut recent_output: Vec<u8> = Vec::new();
+
     loop {
         let (stream, _addr) = listener.accept()?;
-        match handle_client(stream, &process) {
+        match handle_client(stream, &process, &mut recent_output) {
             Ok(ClientOutcome::Detached) => continue, // 次のattachを待つ
             Ok(ClientOutcome::ShellExited) => break,
             Err(e) => {
@@ -64,10 +73,24 @@ enum ClientOutcome {
 
 /// 1クライアントとの間で、pty⇔ソケットの中継を行う。戻り値でクライアントが
 /// 切断しただけなのか、シェル自体が終了したのかを呼び出し側に伝える。
-fn handle_client(stream: UnixStream, process: &PtyProcess) -> std::io::Result<ClientOutcome> {
+fn handle_client(
+    stream: UnixStream,
+    process: &PtyProcess,
+    recent_output: &mut Vec<u8>,
+) -> std::io::Result<ClientOutcome> {
     let master_fd = process.master_fd;
     let socket_fd = stream.as_raw_fd();
     let mut socket_writer = stream.try_clone()?;
+
+    // 直近の出力を送り直す。これをしないと、再アタッチしても画面は空白の
+    // ままになる(シェルは既にプロンプトを出力済みで、それは前のクライアント
+    // に送られてしまっているため、こちらから何か入力するまで何も届かない)。
+    if !recent_output.is_empty() {
+        let frame = protocol::encode_server_message(&ServerMessage::Output(recent_output.clone()));
+        if socket_writer.write_all(&frame).is_err() {
+            return Ok(ClientOutcome::Detached);
+        }
+    }
 
     // Safety: master_fdはPtyProcess(呼び出し元)が生存している間有効。
     // socket_fdは`stream`がこの関数の終わりまでdropされないので有効。
@@ -99,6 +122,8 @@ fn handle_client(stream: UnixStream, process: &PtyProcess) -> std::io::Result<Cl
                     return Ok(ClientOutcome::ShellExited);
                 }
                 Ok(n) => {
+                    remember_output(recent_output, &chunk[..n]);
+
                     let frame =
                         protocol::encode_server_message(&ServerMessage::Output(chunk[..n].to_vec()));
                     if socket_writer.write_all(&frame).is_err() {
@@ -124,8 +149,9 @@ fn handle_client(stream: UnixStream, process: &PtyProcess) -> std::io::Result<Cl
                                 let _ = pty::write_to_pty(master_fd, &bytes);
                             }
                             ClientMessage::Resize { rows, cols } => {
-                                // ptyにサイズを設定すると、カーネルがシェル側へ
-                                // SIGWINCHを送ってくれる(vim等はそれで再描画する)。
+                                // ptyにサイズを設定すると、サイズが実際に
+                                // 変化した場合に限りカーネルがシェル側へ
+                                // SIGWINCHを送る(vim等はそれで再描画する)。
                                 let _ = pty::resize_pty(master_fd, rows, cols);
                             }
                             ClientMessage::Detach => return Ok(ClientOutcome::Detached),
@@ -137,6 +163,15 @@ fn handle_client(stream: UnixStream, process: &PtyProcess) -> std::io::Result<Cl
         if socket_revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
             return Ok(ClientOutcome::Detached);
         }
+    }
+}
+
+/// 直近のpty出力を、上限を超えた分だけ先頭から捨てつつ覚えておく。
+fn remember_output(buffer: &mut Vec<u8>, bytes: &[u8]) {
+    buffer.extend_from_slice(bytes);
+
+    if buffer.len() > REPLAY_BUFFER_BYTES {
+        buffer.drain(..buffer.len() - REPLAY_BUFFER_BYTES);
     }
 }
 
