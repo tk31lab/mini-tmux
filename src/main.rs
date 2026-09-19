@@ -31,8 +31,12 @@ fn main() {
         Some("ls") => {
             cmd_ls();
         }
+        Some("kill-session") => {
+            let name = parse_session_name(&args).unwrap_or_else(|| "default".to_string());
+            cmd_kill_session(&name);
+        }
         _ => {
-            eprintln!("usage: mini-tmux <new|attach|ls> [-s <session-name>]");
+            eprintln!("usage: mini-tmux <new|attach|ls|kill-session> [-s <session-name>]");
             std::process::exit(1);
         }
     }
@@ -107,6 +111,22 @@ fn cmd_attach(session_name: &str) {
     if let Err(e) = client::attach(session_name) {
         eprintln!("mini-tmux: {e}");
         std::process::exit(1);
+    }
+}
+
+/// 拡張: セッションを終了させる(シェルごと終了し、サーバーも終了する)。
+fn cmd_kill_session(session_name: &str) {
+    if !session::is_running(session_name) {
+        eprintln!("mini-tmux: セッション '{session_name}' は起動していません");
+        std::process::exit(1);
+    }
+
+    match client::kill_session(session_name) {
+        Ok(()) => println!("セッション '{session_name}' を終了しました"),
+        Err(e) => {
+            eprintln!("mini-tmux: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

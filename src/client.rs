@@ -15,7 +15,7 @@
 //! プロセスに分離されているので、どちらの方法でもサーバー側のシェルは
 //! 動き続ける。
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 
@@ -56,6 +56,40 @@ pub fn attach(session_name: &str) -> std::io::Result<()> {
     let resize_events = watch_resize()?;
 
     relay_stdin_and_socket(stream, resize_events)
+}
+
+/// セッションを終了させる(シェルを終了させ、サーバーも終了させる)。
+///
+/// サーバーは同時に1クライアントしか相手にしないので、別のターミナルが
+/// アタッチ中だと、この接続は受け付けられないまま待たされる。その場合は
+/// 応答が来ないので、タイムアウトしたらその旨を伝えて諦める。
+pub fn kill_session(session_name: &str) -> std::io::Result<()> {
+    use std::io::Read;
+
+    let socket_path = session::socket_path(session_name);
+    let mut stream = UnixStream::connect(&socket_path)?;
+
+    stream.write_all(&protocol::encode_client_message(&ClientMessage::KillSession))?;
+
+    // サーバーがシェルを終了させて切断するのを待つ。何か返ってくるか、
+    // 切断される(Ok(0))かのどちらかが「処理された」しるし。
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut response = [0u8; 64];
+
+    match stream.read(&mut response) {
+        Ok(_) => Ok(()),
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "セッション '{session_name}' を終了できませんでした。\
+                     別のターミナルがアタッチ中の可能性があります\
+                     (そのターミナルで exit するか、デタッチしてから試してください)"
+                ),
+            ))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Milestone 6: SIGWINCHのハンドラを登録し、通知を受け取るためのfdを返す。

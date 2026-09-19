@@ -15,8 +15,9 @@ pub enum ClientMessage {
     /// Milestone 6: 自分のターミナルのサイズが変わった、という通知。
     Resize { rows: u16, cols: u16 },
     /// デタッチする(サーバー側のシェルは動かしたまま切断する)。
-    /// (専用キーシーケンスでの送信はまだ未実装。プロトコル上は用意済み)
     Detach,
+    /// セッションごと終了させる(シェルを終了させ、サーバーも終了する)。
+    KillSession,
 }
 
 /// サーバーからクライアントへ送るメッセージ。
@@ -30,6 +31,7 @@ pub enum ServerMessage {
 const TAG_INPUT: u8 = 1;
 const TAG_RESIZE: u8 = 2;
 const TAG_DETACH: u8 = 3;
+const TAG_KILL_SESSION: u8 = 4;
 
 const TAG_OUTPUT: u8 = 1;
 const TAG_SHELL_EXITED: u8 = 2;
@@ -69,6 +71,7 @@ pub fn encode_client_message(msg: &ClientMessage) -> Vec<u8> {
             encode_frame(TAG_RESIZE, &body)
         }
         ClientMessage::Detach => encode_frame(TAG_DETACH, &[]),
+        ClientMessage::KillSession => encode_frame(TAG_KILL_SESSION, &[]),
     }
 }
 
@@ -82,6 +85,7 @@ pub fn decode_client_message(buf: &[u8]) -> Option<(ClientMessage, usize)> {
             cols: u16::from_le_bytes([body[2], body[3]]),
         },
         TAG_DETACH => ClientMessage::Detach,
+        TAG_KILL_SESSION => ClientMessage::KillSession,
         // 未知のタグや壊れたフレームは読み飛ばせないので、消費なしのNoneを
         // 返す。呼び出し側はこれ以上進めないので、接続を切るのが安全。
         _ => return None,

@@ -219,6 +219,16 @@ fn handle_client(
                                 let _ = pty::resize_pty(master_fd, rows, cols);
                             }
                             ClientMessage::Detach => return Ok(ClientOutcome::Detached),
+                            ClientMessage::KillSession => {
+                                // 端末が切断されたときと同じSIGHUPを送る。
+                                // シェルは実行中のジョブにもこれを伝えてから終了する。
+                                let _ = nix::sys::signal::killpg(
+                                    nix::unistd::Pid::from_raw(process.child_pid),
+                                    nix::sys::signal::Signal::SIGHUP,
+                                );
+                                let _ = notify_shell_exited(&mut socket_writer, process);
+                                return Ok(ClientOutcome::ShellExited);
+                            }
                         }
                     }
                 }

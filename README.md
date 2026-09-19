@@ -15,7 +15,12 @@ cargo build
 cargo run -- new -s work      # セッションを作ってアタッチ
 cargo run -- attach -s work   # 既存セッションに再アタッチ
 cargo run -- ls               # 起動中のセッション一覧
+cargo run -- kill-session -s work  # セッションを終了させる
 ```
+
+`kill-session` は、別のターミナルがアタッチ中のセッションには使えない
+(サーバーが同時に1クライアントしか相手にしないため)。その場合はそちらで
+`exit` するか、デタッチしてから実行する。
 
 セッション内でのキー操作:
 
